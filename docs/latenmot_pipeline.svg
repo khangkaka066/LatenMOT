@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
+  <title id="title">LatenMOT Pipeline</title>
+  <desc id="desc">Pipeline diagram for lightweight detection, motion prediction, two-stage association, occlusion-aware Kalman, visibility-aware deferred association, conditional ReID, and stable ID output.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#263238"/>
+    </marker>
+    <filter id="shadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#14213d" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .title { font: 800 36px Arial, Helvetica, sans-serif; fill: #14213d; }
+      .subtitle { font: 500 17px Arial, Helvetica, sans-serif; fill: #546a7b; }
+      .lane-title { font: 800 15px Arial, Helvetica, sans-serif; letter-spacing: 1.5px; fill: #51606b; }
+      .box-title { font: 800 20px Arial, Helvetica, sans-serif; fill: #17212b; }
+      .box-text { font: 500 14px Arial, Helvetica, sans-serif; fill: #4f6272; }
+      .small { font: 700 12px Arial, Helvetica, sans-serif; fill: #607584; }
+      .chip { font: 800 12px Arial, Helvetica, sans-serif; fill: #ffffff; }
+      .arrow { stroke: #263238; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .soft-arrow { stroke: #78909c; stroke-width: 2.5; stroke-dasharray: 8 8; fill: none; marker-end: url(#arrow); }
+      .lane { fill: #ffffff; stroke: #d9e2ec; stroke-width: 2; rx: 22; filter: url(#shadow); }
+      .input { fill: #e8f3ff; stroke: #4f8fd8; }
+      .detect { fill: #ecfdf5; stroke: #21a36b; }
+      .motion { fill: #fff4e4; stroke: #f59f00; }
+      .assoc { fill: #f1edff; stroke: #7c5cff; }
+      .lost { fill: #fff0f1; stroke: #e14b5a; }
+      .vada { fill: #eefaf7; stroke: #00a98f; }
+      .reid { fill: #f7f4ea; stroke: #b58b16; }
+      .output { fill: #eaf8ff; stroke: #18a3c8; }
+      .box { stroke-width: 2.5; rx: 18; filter: url(#shadow); }
+      .chip-bg { rx: 12; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1440" height="820"/>
+
+  <text x="70" y="72" class="title">LatenMOT Pipeline</text>
+  <text x="70" y="104" class="subtitle">Lightweight detection + motion prediction + visibility-aware deferred association for stable IDs in crowded scenes</text>
+
+  <rect x="58" y="138" width="1324" height="148" class="lane"/>
+  <text x="82" y="168" class="lane-title">FRAME-LEVEL PERCEPTION</text>
+
+  <rect x="88" y="190" width="178" height="70" class="box input"/>
+  <text x="112" y="220" class="box-title">Video Frame</text>
+  <text x="112" y="244" class="box-text">Read one frame</text>
+
+  <rect x="326" y="184" width="220" height="82" class="box detect"/>
+  <text x="350" y="214" class="box-title">Lightweight YOLO</text>
+  <text x="350" y="238" class="box-text">Person boxes + confidence</text>
+  <text x="350" y="257" class="box-text">T4/Colab friendly detector</text>
+
+  <rect x="606" y="184" width="228" height="82" class="box detect"/>
+  <text x="630" y="214" class="box-title">Confidence Split</text>
+  <text x="630" y="238" class="box-text">High-score detections</text>
+  <text x="630" y="257" class="box-text">Low-score rescue detections</text>
+
+  <rect x="894" y="184" width="250" height="82" class="box vada"/>
+  <text x="918" y="214" class="box-title">Visibility Evidence</text>
+  <text x="918" y="238" class="box-text">score + coverage + uncertainty</text>
+  <text x="918" y="257" class="box-text">used for lifecycle decisions</text>
+
+  <rect x="1204" y="190" width="250" height="70" class="box reid"/>
+  <text x="1228" y="220" class="box-title">Conditional ReID</text>
+  <text x="1228" y="244" class="box-text">HSV appearance only when needed</text>
+
+  <path d="M266 225 H318" class="arrow"/>
+  <path d="M546 225 H598" class="arrow"/>
+  <path d="M834 225 H886" class="arrow"/>
+  <path d="M1144 225 H1196" class="soft-arrow"/>
+
+  <rect x="58" y="324" width="1324" height="242" class="lane"/>
+  <text x="82" y="354" class="lane-title">TRACKING CORE</text>
+
+  <rect x="90" y="388" width="232" height="92" class="box motion"/>
+  <text x="114" y="418" class="box-title">Kalman Prediction</text>
+  <text x="114" y="442" class="box-text">cx, cy, aspect, height</text>
+  <text x="114" y="461" class="box-text">adaptive uncertainty</text>
+
+  <rect x="382" y="376" width="248" height="116" class="box assoc"/>
+  <text x="406" y="406" class="box-title">Two-stage Association</text>
+  <text x="406" y="430" class="box-text">Stage 1: active + high score</text>
+  <text x="406" y="449" class="box-text">Stage 2: active + low score</text>
+  <text x="406" y="468" class="box-text">IoU + motion gate + appearance</text>
+
+  <rect x="690" y="376" width="246" height="116" class="box lost"/>
+  <text x="714" y="406" class="box-title">Occlusion-aware Lost</text>
+  <text x="714" y="430" class="box-text">coverage ratio detects occlusion</text>
+  <text x="714" y="449" class="box-text">velocity damping</text>
+  <text x="714" y="468" class="box-text">enlarged search box</text>
+
+  <rect x="996" y="364" width="290" height="142" class="box vada"/>
+  <text x="1020" y="394" class="box-title">VADA Module</text>
+  <text x="1020" y="418" class="box-text">Visibility-Aware Deferred Association</text>
+  <text x="1020" y="442" class="box-text">deferred ID birth</text>
+  <text x="1020" y="461" class="box-text">evidence-based re-activation</text>
+  <text x="1020" y="480" class="box-text">visibility-gated output</text>
+
+  <path d="M322 434 H374" class="arrow"/>
+  <path d="M630 434 H682" class="arrow"/>
+  <path d="M936 434 H988" class="arrow"/>
+  <path d="M1019 266 C990 304 970 330 948 376" class="soft-arrow"/>
+  <path d="M1280 260 C1264 304 1230 330 1190 364" class="soft-arrow"/>
+
+  <rect x="58" y="604" width="1324" height="138" class="lane"/>
+  <text x="82" y="634" class="lane-title">OUTPUT</text>
+
+  <rect x="104" y="658" width="260" height="72" class="box output"/>
+  <text x="128" y="688" class="box-title">Stable Track States</text>
+  <text x="128" y="712" class="box-text">TRACKED / OCC / LOST / REMOVED</text>
+
+  <rect x="460" y="658" width="250" height="72" class="box output"/>
+  <text x="484" y="688" class="box-title">Stable IDs</text>
+  <text x="484" y="712" class="box-text">only confident tracks are shown</text>
+
+  <rect x="806" y="658" width="250" height="72" class="box output"/>
+  <text x="830" y="688" class="box-title">MOT Text</text>
+  <text x="830" y="712" class="box-text">frame, id, x, y, w, h, score</text>
+
+  <rect x="1146" y="658" width="250" height="72" class="box output"/>
+  <text x="1170" y="688" class="box-title">Output Video</text>
+  <text x="1170" y="712" class="box-text">visualized boxes and IDs</text>
+
+  <path d="M1141 506 C1090 566 990 618 364 694" class="arrow"/>
+  <path d="M364 694 H452" class="arrow"/>
+  <path d="M710 694 H798" class="arrow"/>
+  <path d="M1056 694 H1138" class="arrow"/>
+
+  <rect x="91" y="770" width="166" height="28" class="chip-bg" fill="#21a36b"/>
+  <text x="111" y="789" class="chip">DETECTION</text>
+  <rect x="282" y="770" width="148" height="28" class="chip-bg" fill="#f59f00"/>
+  <text x="306" y="789" class="chip">MOTION</text>
+  <rect x="454" y="770" width="172" height="28" class="chip-bg" fill="#7c5cff"/>
+  <text x="478" y="789" class="chip">ASSOCIATION</text>
+  <rect x="650" y="770" width="184" height="28" class="chip-bg" fill="#e14b5a"/>
+  <text x="674" y="789" class="chip">OCCLUSION</text>
+  <rect x="858" y="770" width="300" height="28" class="chip-bg" fill="#00a98f"/>
+  <text x="882" y="789" class="chip">VISIBILITY-AWARE DEFERRED ASSOCIATION</text>
+  <rect x="1182" y="770" width="150" height="28" class="chip-bg" fill="#18a3c8"/>
+  <text x="1212" y="789" class="chip">OUTPUT</text>
+</svg>

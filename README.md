@@ -4,6 +4,8 @@ Pipeline MOT nhẹ:
 
 `Lightweight Detection -> Motion Prediction -> Two-stage Association -> Lost Track Re-activation -> Conditional ReID -> Stable ID`
 
+![LatenMOT pipeline](docs/latenmot_pipeline.svg)
+
 Checkpoint detector đã có trong thư mục:
 
 ```text
