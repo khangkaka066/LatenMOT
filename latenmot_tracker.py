@@ -2,10 +2,6 @@
 """
 LatenMOT: lightweight detector + motion + two-stage association + lost-track
 reactivation + conditional appearance ReID.
-
-Designed for Kaggle/Colab T4:
-    python latenmot_tracker.py --weights "best_crossval_v11_non_early_stop (1).pt" \
-        --source input.mp4 --output output.mp4 --device 0
 """
 
 from __future__ import annotations
@@ -49,6 +45,19 @@ class LatenMOTConfig:
     occlusion_velocity_damping: float = 0.55
     occlusion_reset_alpha: float = 0.08
     occlusion_box_enlarge: float = 1.25
+    visibility_momentum: float = 0.75
+    lost_visibility_decay: float = 0.92
+    occluded_visibility_decay: float = 0.96
+    output_visibility_thresh: float = 0.16
+    lost_output_visibility_thresh: float = 0.22
+    use_deferred_birth: bool = True
+    pending_confirm_hits: int = 3
+    pending_max_misses: int = 2
+    pending_min_iou: float = 0.18
+    use_deferred_reactivation: bool = True
+    reactivation_evidence_thresh: float = 0.95
+    reactivation_strong_quality: float = 0.72
+    reactivation_evidence_decay: float = 0.65
     min_box_area: float = 12.0
     use_reid: bool = True
     use_active_reid: bool = True
@@ -131,6 +140,31 @@ def coverage_ratio(target: np.ndarray, occluders: np.ndarray) -> float:
     wh = np.clip(rb - lt, 0.0, None)
     inter = wh[:, 0] * wh[:, 1]
     return float(np.max(inter / target_area))
+
+
+def detection_coverages(detections: Sequence[Detection]) -> dict[int, float]:
+    boxes = np.array([d.xyxy for d in detections], dtype=np.float32)
+    coverages: dict[int, float] = {}
+    for idx, det in enumerate(detections):
+        if len(detections) <= 1:
+            coverages[id(det)] = 0.0
+            continue
+        others = np.delete(boxes, idx, axis=0)
+        coverages[id(det)] = coverage_ratio(det.xyxy, others)
+    return coverages
+
+
+def motion_uncertainty(mean: np.ndarray, covariance: np.ndarray) -> float:
+    h = max(1.0, float(mean[3]))
+    pos_sigma = float(np.sqrt(max(0.0, np.trace(covariance[:2, :2]))))
+    return float(np.clip(pos_sigma / h, 0.0, 2.0) / 2.0)
+
+
+def visibility_from_evidence(score: float, coverage: float, uncertainty: float) -> float:
+    score_term = float(np.clip(score, 0.0, 1.0))
+    coverage_term = 1.0 - 0.65 * float(np.clip(coverage, 0.0, 1.0))
+    uncertainty_term = 1.0 - 0.45 * float(np.clip(uncertainty, 0.0, 1.0))
+    return float(np.clip(score_term * coverage_term * uncertainty_term, 0.0, 1.0))
 
 
 def motion_gated_iou_cost(
@@ -386,6 +420,8 @@ class Track:
         self.occlusion_age = 0
         self.search_enlarge = 1.0
         self.last_observed_mean = self.mean.copy()
+        self.visibility = float(detection.score)
+        self.reactivation_evidence = 0.0
         self.smooth_feature = detection.feature
 
     @property
@@ -416,6 +452,7 @@ class Track:
         if self.is_occluded:
             self.occlusion_age += 1
             self.search_enlarge = cfg.occlusion_box_enlarge
+            self.visibility *= cfg.occluded_visibility_decay
             self.mean, self.covariance = kf.apply_occlusion_damping(
                 self.mean,
                 self.covariance,
@@ -423,8 +460,18 @@ class Track:
                 cfg.occlusion_velocity_damping,
                 cfg.occlusion_reset_alpha,
             )
+        elif self.state == TrackState.LOST:
+            self.visibility *= cfg.lost_visibility_decay
 
-    def update(self, detection: Detection, frame_id: int, kf: KalmanFilter, alpha: float) -> None:
+    def update(
+        self,
+        detection: Detection,
+        frame_id: int,
+        kf: KalmanFilter,
+        alpha: float,
+        cfg: LatenMOTConfig,
+        coverage: float = 0.0,
+    ) -> None:
         self.mean, self.covariance = kf.update(
             self.mean, self.covariance, tlwh_to_xyah(detection.tlwh), detection.score
         )
@@ -438,6 +485,13 @@ class Track:
         self.occlusion_age = 0
         self.search_enlarge = 1.0
         self.last_observed_mean = self.mean.copy()
+        uncertainty = motion_uncertainty(self.mean, self.covariance)
+        instant_visibility = visibility_from_evidence(detection.score, coverage, uncertainty)
+        self.visibility = (
+            cfg.visibility_momentum * self.visibility
+            + (1.0 - cfg.visibility_momentum) * instant_visibility
+        )
+        self.reactivation_evidence = 0.0
         if detection.feature is not None:
             if self.smooth_feature is None:
                 self.smooth_feature = detection.feature
@@ -447,11 +501,12 @@ class Track:
                 if norm > 1e-12:
                     self.smooth_feature = self.smooth_feature / norm
 
-    def mark_lost(self, frame_id: int) -> None:
+    def mark_lost(self, frame_id: int, cfg: LatenMOTConfig) -> None:
         self.state = TrackState.LOST
         self.lost_since = frame_id if self.lost_since is None else self.lost_since
         self.is_occluded = False
         self.search_enlarge = 1.0
+        self.visibility *= cfg.lost_visibility_decay
 
     def mark_occluded(self, frame_id: int, kf: KalmanFilter, cfg: LatenMOTConfig) -> None:
         self.state = TrackState.LOST
@@ -460,6 +515,7 @@ class Track:
             self.occlusion_age = 0
         self.is_occluded = True
         self.search_enlarge = cfg.occlusion_box_enlarge
+        self.visibility *= cfg.occluded_visibility_decay
         self.mean, self.covariance = kf.apply_occlusion_damping(
             self.mean,
             self.covariance,
@@ -472,12 +528,69 @@ class Track:
         self.state = TrackState.REMOVED
 
 
+class PendingCandidate:
+    def __init__(self, detection: Detection, frame_id: int, cfg: LatenMOTConfig) -> None:
+        self.tlwh = detection.tlwh.copy()
+        self.xyxy = detection.xyxy.copy()
+        self.score_sum = float(detection.score)
+        self.score = float(detection.score)
+        self.cls = detection.cls
+        self.first_frame = frame_id
+        self.last_frame = frame_id
+        self.hits = 1
+        self.misses = 0
+        self.feature = detection.feature
+        uncertainty = 0.0
+        self.visibility = visibility_from_evidence(detection.score, 0.0, uncertainty)
+
+    def update(self, detection: Detection, frame_id: int, cfg: LatenMOTConfig, coverage: float) -> None:
+        self.tlwh = detection.tlwh.copy()
+        self.xyxy = detection.xyxy.copy()
+        self.score_sum += float(detection.score)
+        self.score = float(detection.score)
+        self.cls = detection.cls
+        self.last_frame = frame_id
+        self.hits += 1
+        self.misses = 0
+        instant_visibility = visibility_from_evidence(detection.score, coverage, 0.0)
+        self.visibility = (
+            cfg.visibility_momentum * self.visibility
+            + (1.0 - cfg.visibility_momentum) * instant_visibility
+        )
+        if detection.feature is not None:
+            if self.feature is None:
+                self.feature = detection.feature
+            else:
+                self.feature = cfg.feature_alpha * self.feature + (1.0 - cfg.feature_alpha) * detection.feature
+                norm = np.linalg.norm(self.feature)
+                if norm > 1e-12:
+                    self.feature = self.feature / norm
+
+    def mark_missed(self) -> None:
+        self.misses += 1
+        self.visibility *= 0.85
+
+    def is_confirmed(self, cfg: LatenMOTConfig) -> bool:
+        return self.hits >= cfg.pending_confirm_hits and self.visibility >= cfg.output_visibility_thresh
+
+    def to_detection(self) -> Detection:
+        avg_score = max(self.score, self.score_sum / max(1, self.hits))
+        return Detection(
+            xyxy=self.xyxy.copy(),
+            tlwh=self.tlwh.copy(),
+            score=float(avg_score),
+            cls=self.cls,
+            feature=self.feature,
+        )
+
+
 class LatenMOTTracker:
     def __init__(self, config: LatenMOTConfig) -> None:
         self.cfg = config
         self.kf = KalmanFilter()
         self.reid = ColorHistReID()
         self.tracks: List[Track] = []
+        self.pending_candidates: List[PendingCandidate] = []
         self.frame_id = 0
 
     def _ensure_features(self, frame: np.ndarray, detections: Sequence[Detection], indices: Iterable[int]) -> None:
@@ -536,7 +649,65 @@ class LatenMOTTracker:
             if coverage >= self.cfg.occlusion_coverage_thresh:
                 track.mark_occluded(self.frame_id, self.kf, self.cfg)
             else:
-                track.mark_lost(self.frame_id)
+                track.mark_lost(self.frame_id, self.cfg)
+
+    def _update_pending_candidates(
+        self,
+        frame: np.ndarray,
+        detections: Sequence[Detection],
+        coverage_by_det: dict[int, float],
+    ) -> List[Track]:
+        if not self.cfg.use_deferred_birth:
+            return []
+
+        self._ensure_features(frame, detections, range(len(detections)))
+        confirmed_tracks: List[Track] = []
+        if self.pending_candidates and detections:
+            cand_boxes = np.array([c.xyxy for c in self.pending_candidates], dtype=np.float32)
+            det_boxes = np.array([d.xyxy for d in detections], dtype=np.float32)
+            cost = 1.0 - bbox_iou(cand_boxes, det_boxes)
+            for r, candidate in enumerate(self.pending_candidates):
+                if candidate.feature is None:
+                    continue
+                for c, det in enumerate(detections):
+                    app_dist = cosine_distance(candidate.feature, det.feature)
+                    if app_dist <= self.cfg.active_appearance_thresh:
+                        cost[r, c] = min(cost[r, c], 0.65 * cost[r, c] + 0.35 * app_dist)
+            matches, unmatched_candidates, unmatched_dets = linear_assignment_with_threshold(
+                cost, max_cost=1.0 - self.cfg.pending_min_iou
+            )
+        else:
+            matches = []
+            unmatched_candidates = list(range(len(self.pending_candidates)))
+            unmatched_dets = list(range(len(detections)))
+
+        for cand_idx, det_idx in matches:
+            candidate = self.pending_candidates[cand_idx]
+            det = detections[det_idx]
+            candidate.update(det, self.frame_id, self.cfg, coverage_by_det.get(id(det), 0.0))
+            if candidate.is_confirmed(self.cfg):
+                confirmed_tracks.append(Track(candidate.to_detection(), self.frame_id, self.kf))
+
+        confirmed_indices = {
+            idx for idx, candidate in enumerate(self.pending_candidates) if candidate.is_confirmed(self.cfg)
+        }
+        for cand_idx in unmatched_candidates:
+            if cand_idx in confirmed_indices:
+                continue
+            self.pending_candidates[cand_idx].mark_missed()
+
+        self.pending_candidates = [
+            c
+            for idx, c in enumerate(self.pending_candidates)
+            if idx not in confirmed_indices and c.misses <= self.cfg.pending_max_misses
+        ]
+
+        for det_idx in unmatched_dets:
+            det = detections[det_idx]
+            if det.score >= self.cfg.new_track_thresh:
+                self.pending_candidates.append(PendingCandidate(det, self.frame_id, self.cfg))
+
+        return confirmed_tracks
 
     def update(self, frame: np.ndarray, detections: List[Detection]) -> List[Track]:
         self.frame_id += 1
@@ -546,6 +717,7 @@ class LatenMOTTracker:
             for d in detections
             if d.tlwh[2] * d.tlwh[3] >= self.cfg.min_box_area and d.tlwh[2] > 1 and d.tlwh[3] > 1
         ]
+        coverage_by_det = detection_coverages(detections)
         high_dets = [d for d in detections if d.score >= self.cfg.track_high_thresh]
         low_dets = [d for d in detections if self.cfg.track_low_thresh <= d.score < self.cfg.track_high_thresh]
 
@@ -567,7 +739,15 @@ class LatenMOTTracker:
         )
         for trk_idx, det_idx in stage1_matches:
             self._ensure_features(frame, high_dets, [det_idx])
-            active_tracks[trk_idx].update(high_dets[det_idx], self.frame_id, self.kf, self.cfg.feature_alpha)
+            det = high_dets[det_idx]
+            active_tracks[trk_idx].update(
+                det,
+                self.frame_id,
+                self.kf,
+                self.cfg.feature_alpha,
+                self.cfg,
+                coverage_by_det.get(id(det), 0.0),
+            )
 
         # Stage 2: low confidence detections can keep existing tracks alive.
         remaining_active = [active_tracks[i] for i in unmatched_active]
@@ -583,7 +763,15 @@ class LatenMOTTracker:
         )
         for trk_idx, det_idx in stage2_matches:
             self._ensure_features(frame, low_dets, [det_idx])
-            remaining_active[trk_idx].update(low_dets[det_idx], self.frame_id, self.kf, self.cfg.feature_alpha)
+            det = low_dets[det_idx]
+            remaining_active[trk_idx].update(
+                det,
+                self.frame_id,
+                self.kf,
+                self.cfg.feature_alpha,
+                self.cfg,
+                coverage_by_det.get(id(det), 0.0),
+            )
 
         matched_current_tracks = [
             t for t in self.tracks if t.state == TrackState.TRACKED and t.last_seen == self.frame_id
@@ -598,21 +786,43 @@ class LatenMOTTracker:
         remaining_high = [high_dets[i] for i in unmatched_high]
         self._ensure_features(frame, remaining_high, range(len(remaining_high)))
         lost_tracks = [t for t in self.tracks if t.state == TrackState.LOST]
+        react_cost = self._reactivation_cost(lost_tracks, remaining_high)
         react_matches, unmatched_lost, unmatched_remaining_high = linear_assignment_with_threshold(
-            self._reactivation_cost(lost_tracks, remaining_high),
+            react_cost,
             max_cost=self.cfg.reactivation_cost_thresh,
         )
         for trk_idx, det_idx in react_matches:
-            lost_tracks[trk_idx].update(
-                remaining_high[det_idx], self.frame_id, self.kf, self.cfg.feature_alpha
+            track = lost_tracks[trk_idx]
+            det = remaining_high[det_idx]
+            quality = max(0.0, 1.0 - float(react_cost[trk_idx, det_idx]) / self.cfg.reactivation_cost_thresh)
+            track.reactivation_evidence = (
+                self.cfg.reactivation_evidence_decay * track.reactivation_evidence + quality
             )
+            strong_match = quality >= self.cfg.reactivation_strong_quality
+            enough_evidence = track.reactivation_evidence >= self.cfg.reactivation_evidence_thresh
+            if (not self.cfg.use_deferred_reactivation) or strong_match or enough_evidence:
+                track.update(
+                    det,
+                    self.frame_id,
+                    self.kf,
+                    self.cfg.feature_alpha,
+                    self.cfg,
+                    coverage_by_det.get(id(det), 0.0),
+                )
+
+        for trk_idx in unmatched_lost:
+            lost_tracks[trk_idx].reactivation_evidence *= self.cfg.reactivation_evidence_decay
 
         # Only create a new ID after active and lost tracks had a chance to match.
-        for det_idx in unmatched_remaining_high:
-            det = remaining_high[det_idx]
-            if det.score >= self.cfg.new_track_thresh:
-                self._ensure_features(frame, remaining_high, [det_idx])
-                self.tracks.append(Track(det, self.frame_id, self.kf))
+        birth_det_indices = list(unmatched_remaining_high)
+        birth_dets = [remaining_high[i] for i in birth_det_indices]
+        if self.cfg.use_deferred_birth:
+            self.tracks.extend(self._update_pending_candidates(frame, birth_dets, coverage_by_det))
+        else:
+            for det in birth_dets:
+                if det.score >= self.cfg.new_track_thresh:
+                    self._ensure_features(frame, [det], [0])
+                    self.tracks.append(Track(det, self.frame_id, self.kf))
 
         for trk_idx in unmatched_lost:
             track = lost_tracks[trk_idx]
@@ -620,12 +830,19 @@ class LatenMOTTracker:
                 track.mark_removed()
 
         self.tracks = [t for t in self.tracks if t.state != TrackState.REMOVED]
-        visible_tracks = [t for t in self.tracks if t.state == TrackState.TRACKED and t.last_seen == self.frame_id]
+        visible_tracks = [
+            t
+            for t in self.tracks
+            if t.state == TrackState.TRACKED
+            and t.last_seen == self.frame_id
+            and t.visibility >= self.cfg.output_visibility_thresh
+        ]
         if self.cfg.draw_lost_frames > 0:
             visible_tracks.extend(
                 t
                 for t in self.tracks
                 if t.state == TrackState.LOST and self.frame_id - t.last_seen <= self.cfg.draw_lost_frames
+                and t.visibility >= self.cfg.lost_output_visibility_thresh
             )
         return visible_tracks
 
@@ -746,6 +963,19 @@ def run_video(args: argparse.Namespace) -> None:
         occlusion_velocity_damping=args.occlusion_velocity_damping,
         occlusion_reset_alpha=args.occlusion_reset_alpha,
         occlusion_box_enlarge=args.occlusion_box_enlarge,
+        visibility_momentum=args.visibility_momentum,
+        lost_visibility_decay=args.lost_visibility_decay,
+        occluded_visibility_decay=args.occluded_visibility_decay,
+        output_visibility_thresh=args.output_visibility_thresh,
+        lost_output_visibility_thresh=args.lost_output_visibility_thresh,
+        use_deferred_birth=not args.no_deferred_birth,
+        pending_confirm_hits=args.pending_confirm_hits,
+        pending_max_misses=args.pending_max_misses,
+        pending_min_iou=args.pending_min_iou,
+        use_deferred_reactivation=not args.no_deferred_reactivation,
+        reactivation_evidence_thresh=args.reactivation_evidence_thresh,
+        reactivation_strong_quality=args.reactivation_strong_quality,
+        reactivation_evidence_decay=args.reactivation_evidence_decay,
         min_box_area=args.min_box_area,
         use_reid=not args.no_reid,
         use_active_reid=not args.no_active_reid,
@@ -833,6 +1063,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--occlusion-velocity-damping", type=float, default=0.55)
     parser.add_argument("--occlusion-reset-alpha", type=float, default=0.08)
     parser.add_argument("--occlusion-box-enlarge", type=float, default=1.25)
+    parser.add_argument("--visibility-momentum", type=float, default=0.75)
+    parser.add_argument("--lost-visibility-decay", type=float, default=0.92)
+    parser.add_argument("--occluded-visibility-decay", type=float, default=0.96)
+    parser.add_argument("--output-visibility-thresh", type=float, default=0.16)
+    parser.add_argument("--lost-output-visibility-thresh", type=float, default=0.22)
+    parser.add_argument("--pending-confirm-hits", type=int, default=3)
+    parser.add_argument("--pending-max-misses", type=int, default=2)
+    parser.add_argument("--pending-min-iou", type=float, default=0.18)
+    parser.add_argument("--reactivation-evidence-thresh", type=float, default=0.95)
+    parser.add_argument("--reactivation-strong-quality", type=float, default=0.72)
+    parser.add_argument("--reactivation-evidence-decay", type=float, default=0.65)
+    parser.add_argument("--no-deferred-birth", action="store_true")
+    parser.add_argument("--no-deferred-reactivation", action="store_true")
     parser.add_argument("--reid-after-frames", type=int, default=2)
     parser.add_argument("--feature-alpha", type=float, default=0.9)
     parser.add_argument("--min-box-area", type=float, default=12.0)

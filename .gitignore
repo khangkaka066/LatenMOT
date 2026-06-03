@@ -3,5 +3,6 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 .claude/
+.history/
 latenmot_output.mp4
 latenmot_tracks.txt

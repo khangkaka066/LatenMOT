@@ -88,6 +88,40 @@ Nếu video có đám đông, dùng preset nhạy hơn:
   --person-class 0
 ```
 
+Preset thử nghiệm cho hướng paper `Visibility-Aware Deferred Association`:
+
+```python
+!python latenmot_tracker.py \
+  --weights "/content/drive/MyDrive/best_crossval_v11_non_early_stop(1).pt" \
+  --source "/content/drive/MyDrive/test_video.mp4" \
+  --output "/content/latenmot_output_vada.mp4" \
+  --save-mot "/content/latenmot_tracks_vada.txt" \
+  --device 0 \
+  --imgsz 960 \
+  --det-iou 0.82 \
+  --max-det 1000 \
+  --track-high-thresh 0.45 \
+  --track-low-thresh 0.08 \
+  --new-track-thresh 0.58 \
+  --stage1-min-iou 0.16 \
+  --stage2-min-iou 0.08 \
+  --track-buffer 70 \
+  --draw-lost-frames 8 \
+  --motion-gate 20 \
+  --lost-motion-gate 42 \
+  --motion-lambda 0.12 \
+  --occlusion-coverage-thresh 0.55 \
+  --occlusion-velocity-damping 0.6 \
+  --occlusion-reset-alpha 0.07 \
+  --occlusion-box-enlarge 1.18 \
+  --pending-confirm-hits 3 \
+  --pending-max-misses 2 \
+  --output-visibility-thresh 0.2 \
+  --lost-output-visibility-thresh 0.28 \
+  --reactivation-evidence-thresh 0.95 \
+  --person-class 0
+```
+
 ## Ý tưởng chính
 
 - YOLO/Ultralytics load trực tiếp trọng số `.pt` để detect người.
@@ -99,3 +133,4 @@ Nếu video có đám đông, dùng preset nhạy hơn:
 - Với cảnh đông, `--det-iou` cao và `--max-det` lớn giúp YOLO giữ lại nhiều box chồng nhau hơn sau NMS.
 - Kalman dùng adaptive uncertainty, confidence-aware update và Mahalanobis motion gating để giảm nối nhầm ID.
 - Occlusion-aware Kalman phát hiện track bị che bằng coverage ratio, giảm velocity, reset mềm về vị trí quan sát cuối và nới box tìm kiếm khi re-activate.
+- Visibility-Aware Deferred Association trì hoãn ID mới và re-activation yếu cho đến khi có đủ bằng chứng qua nhiều frame.
