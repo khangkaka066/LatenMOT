@@ -29,6 +29,34 @@ best_crossval_v11_non_early_stop (1).pt
 
 Trên Colab, thay `--source` bằng đường dẫn video trong `/content/...` và `--output` bằng `/content/latenmot_output.mp4`.
 
+Ví dụ Colab với Google Drive:
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+
+```python
+%cd /content
+!git clone https://github.com/khangkaka066/LatenMOT.git || true
+%cd /content/LatenMOT
+!git pull
+!pip install -q -r requirements.txt
+```
+
+```python
+!python latenmot_tracker.py \
+  --weights "/content/drive/MyDrive/best_crossval_v11_non_early_stop(1).pt" \
+  --source "/content/drive/MyDrive/test_video.mp4" \
+  --output "/content/drive/MyDrive/latenmot_output.mp4" \
+  --save-mot "/content/drive/MyDrive/latenmot_tracks.txt" \
+  --device 0 \
+  --imgsz 640 \
+  --person-class 0
+```
+
+Nếu `VideoWriter` vẫn lỗi trên Drive, hãy xuất tạm vào `/content/latenmot_output.mp4`, sau đó tải file về hoặc copy sang Drive.
+
 ## Ý tưởng chính
 
 - YOLO/Ultralytics load trực tiếp trọng số `.pt` để detect người.
