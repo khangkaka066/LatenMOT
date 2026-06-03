@@ -31,17 +31,20 @@ class TrackState(str, Enum):
 
 @dataclass
 class LatenMOTConfig:
-    track_high_thresh: float = 0.55
-    track_low_thresh: float = 0.12
-    new_track_thresh: float = 0.65
-    stage1_min_iou: float = 0.25
-    stage2_min_iou: float = 0.12
+    track_high_thresh: float = 0.45
+    track_low_thresh: float = 0.05
+    new_track_thresh: float = 0.55
+    stage1_min_iou: float = 0.18
+    stage2_min_iou: float = 0.08
     reactivation_min_iou: float = 0.08
     appearance_thresh: float = 0.42
+    active_appearance_thresh: float = 0.48
     reactivation_cost_thresh: float = 0.72
-    track_buffer: int = 45
+    track_buffer: int = 60
+    draw_lost_frames: int = 12
     min_box_area: float = 12.0
     use_reid: bool = True
+    use_active_reid: bool = True
     reid_after_frames: int = 2
     feature_alpha: float = 0.9
 
@@ -98,6 +101,36 @@ def iou_cost(tracks: Sequence["Track"], detections: Sequence[Detection]) -> np.n
     track_boxes = np.array([t.xyxy for t in tracks], dtype=np.float32)
     det_boxes = np.array([d.xyxy for d in detections], dtype=np.float32)
     return 1.0 - bbox_iou(track_boxes, det_boxes)
+
+
+def active_association_cost(
+    tracks: Sequence["Track"], detections: Sequence[Detection], cfg: LatenMOTConfig
+) -> np.ndarray:
+    if not tracks or not detections:
+        return np.zeros((len(tracks), len(detections)), dtype=np.float32)
+
+    iou_dist = iou_cost(tracks, detections)
+    if not cfg.use_reid or not cfg.use_active_reid:
+        return iou_dist
+
+    cost = np.full_like(iou_dist, fill_value=np.inf, dtype=np.float32)
+    for r, track in enumerate(tracks):
+        for c, det in enumerate(detections):
+            iou = 1.0 - float(iou_dist[r, c])
+            app_dist = cosine_distance(track.smooth_feature, det.feature)
+            can_use_motion = iou >= cfg.stage1_min_iou
+            can_use_appearance = (
+                track.smooth_feature is not None
+                and det.feature is not None
+                and app_dist <= cfg.active_appearance_thresh
+            )
+            if can_use_motion or can_use_appearance:
+                cost[r, c] = (
+                    0.65 * iou_dist[r, c] + 0.35 * app_dist
+                    if can_use_appearance
+                    else iou_dist[r, c]
+                )
+    return cost
 
 
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -354,8 +387,13 @@ class LatenMOTTracker:
         lost_tracks = [t for t in self.tracks if t.state == TrackState.LOST]
 
         # Stage 1: confident detections against active tracks using motion/IoU.
+        # In crowded scenes, a cheap appearance fallback helps preserve IDs when
+        # boxes jump because people overlap.
+        if self.cfg.use_active_reid:
+            self._ensure_features(frame, high_dets, range(len(high_dets)))
         stage1_matches, unmatched_active, unmatched_high = linear_assignment_with_threshold(
-            iou_cost(active_tracks, high_dets), max_cost=1.0 - self.cfg.stage1_min_iou
+            active_association_cost(active_tracks, high_dets, self.cfg),
+            max_cost=1.0 - self.cfg.stage1_min_iou,
         )
         for trk_idx, det_idx in stage1_matches:
             self._ensure_features(frame, high_dets, [det_idx])
@@ -399,7 +437,14 @@ class LatenMOTTracker:
                 track.mark_removed()
 
         self.tracks = [t for t in self.tracks if t.state != TrackState.REMOVED]
-        return [t for t in self.tracks if t.state == TrackState.TRACKED and t.last_seen == self.frame_id]
+        visible_tracks = [t for t in self.tracks if t.state == TrackState.TRACKED and t.last_seen == self.frame_id]
+        if self.cfg.draw_lost_frames > 0:
+            visible_tracks.extend(
+                t
+                for t in self.tracks
+                if t.state == TrackState.LOST and self.frame_id - t.last_seen <= self.cfg.draw_lost_frames
+            )
+        return visible_tracks
 
 
 class YOLODetector:
@@ -409,6 +454,9 @@ class YOLODetector:
         device: str,
         imgsz: int,
         conf: float,
+        iou: float,
+        max_det: int,
+        agnostic_nms: bool,
         person_class: Optional[int],
     ) -> None:
         from ultralytics import YOLO
@@ -417,6 +465,9 @@ class YOLODetector:
         self.device = device
         self.imgsz = imgsz
         self.conf = conf
+        self.iou = iou
+        self.max_det = max_det
+        self.agnostic_nms = agnostic_nms
         self.person_class = person_class
 
     def __call__(self, frame: np.ndarray) -> List[Detection]:
@@ -425,6 +476,9 @@ class YOLODetector:
             frame,
             imgsz=self.imgsz,
             conf=self.conf,
+            iou=self.iou,
+            max_det=self.max_det,
+            agnostic_nms=self.agnostic_nms,
             device=self.device,
             classes=classes,
             verbose=False,
@@ -452,9 +506,11 @@ def draw_tracks(frame: np.ndarray, tracks: Sequence[Track]) -> np.ndarray:
     out = frame.copy()
     for track in tracks:
         x1, y1, x2, y2 = track.xyxy.astype(int)
-        color = id_color(track.track_id)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        label = f"ID {track.track_id} {track.score:.2f}"
+        color = id_color(track.track_id) if track.state == TrackState.TRACKED else (180, 180, 180)
+        thickness = 2 if track.state == TrackState.TRACKED else 1
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+        prefix = "ID" if track.state == TrackState.TRACKED else "LOST"
+        label = f"{prefix} {track.track_id} {track.score:.2f}"
         (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         y_text = max(0, y1 - th - baseline - 4)
         cv2.rectangle(out, (x1, y_text), (x1 + tw + 8, y_text + th + baseline + 6), color, -1)
@@ -483,6 +539,9 @@ def run_video(args: argparse.Namespace) -> None:
         device=args.device,
         imgsz=args.imgsz,
         conf=args.track_low_thresh,
+        iou=args.det_iou,
+        max_det=args.max_det,
+        agnostic_nms=args.agnostic_nms,
         person_class=args.person_class,
     )
     cfg = LatenMOTConfig(
@@ -493,10 +552,13 @@ def run_video(args: argparse.Namespace) -> None:
         stage2_min_iou=args.stage2_min_iou,
         reactivation_min_iou=args.reactivation_min_iou,
         appearance_thresh=args.appearance_thresh,
+        active_appearance_thresh=args.active_appearance_thresh,
         reactivation_cost_thresh=args.reactivation_cost_thresh,
         track_buffer=args.track_buffer,
+        draw_lost_frames=args.draw_lost_frames,
         min_box_area=args.min_box_area,
         use_reid=not args.no_reid,
+        use_active_reid=not args.no_active_reid,
         reid_after_frames=args.reid_after_frames,
         feature_alpha=args.feature_alpha,
     )
@@ -555,24 +617,30 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="latenmot_output.mp4")
     parser.add_argument("--device", default="0", help="Use 0 on GPU T4, or cpu")
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--det-iou", type=float, default=0.85, help="YOLO NMS IoU; higher keeps more overlapping crowd boxes")
+    parser.add_argument("--max-det", type=int, default=1000, help="Maximum detections per frame before tracking")
+    parser.add_argument("--agnostic-nms", action="store_true", help="Class-agnostic NMS; usually leave off for one-class people tracking")
     parser.add_argument("--person-class", type=int, default=0, help="Set -1 to keep all classes")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--fourcc", default="mp4v")
     parser.add_argument("--save-mot", default="", help="Optional MOTChallenge txt output path")
 
-    parser.add_argument("--track-high-thresh", type=float, default=0.55)
-    parser.add_argument("--track-low-thresh", type=float, default=0.12)
-    parser.add_argument("--new-track-thresh", type=float, default=0.65)
-    parser.add_argument("--stage1-min-iou", type=float, default=0.25)
-    parser.add_argument("--stage2-min-iou", type=float, default=0.12)
+    parser.add_argument("--track-high-thresh", type=float, default=0.45)
+    parser.add_argument("--track-low-thresh", type=float, default=0.05)
+    parser.add_argument("--new-track-thresh", type=float, default=0.55)
+    parser.add_argument("--stage1-min-iou", type=float, default=0.18)
+    parser.add_argument("--stage2-min-iou", type=float, default=0.08)
     parser.add_argument("--reactivation-min-iou", type=float, default=0.08)
     parser.add_argument("--appearance-thresh", type=float, default=0.42)
+    parser.add_argument("--active-appearance-thresh", type=float, default=0.48)
     parser.add_argument("--reactivation-cost-thresh", type=float, default=0.72)
-    parser.add_argument("--track-buffer", type=int, default=45)
+    parser.add_argument("--track-buffer", type=int, default=60)
+    parser.add_argument("--draw-lost-frames", type=int, default=12)
     parser.add_argument("--reid-after-frames", type=int, default=2)
     parser.add_argument("--feature-alpha", type=float, default=0.9)
     parser.add_argument("--min-box-area", type=float, default=12.0)
     parser.add_argument("--no-reid", action="store_true")
+    parser.add_argument("--no-active-reid", action="store_true")
     return parser
 
 

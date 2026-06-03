@@ -52,10 +52,34 @@ drive.mount("/content/drive")
   --save-mot "/content/drive/MyDrive/latenmot_tracks.txt" \
   --device 0 \
   --imgsz 640 \
+  --det-iou 0.85 \
+  --max-det 1000 \
   --person-class 0
 ```
 
 Nếu `VideoWriter` vẫn lỗi trên Drive, hãy xuất tạm vào `/content/latenmot_output.mp4`, sau đó tải file về hoặc copy sang Drive.
+
+Nếu video có đám đông, dùng preset nhạy hơn:
+
+```python
+!python latenmot_tracker.py \
+  --weights "/content/drive/MyDrive/best_crossval_v11_non_early_stop(1).pt" \
+  --source "/content/drive/MyDrive/test_video.mp4" \
+  --output "/content/latenmot_output.mp4" \
+  --save-mot "/content/latenmot_tracks.txt" \
+  --device 0 \
+  --imgsz 960 \
+  --det-iou 0.9 \
+  --max-det 1500 \
+  --track-high-thresh 0.35 \
+  --track-low-thresh 0.03 \
+  --new-track-thresh 0.45 \
+  --stage1-min-iou 0.12 \
+  --stage2-min-iou 0.05 \
+  --track-buffer 90 \
+  --draw-lost-frames 20 \
+  --person-class 0
+```
 
 ## Ý tưởng chính
 
@@ -65,3 +89,4 @@ Nếu `VideoWriter` vẫn lỗi trên Drive, hãy xuất tạm vào `/content/la
 - Association stage 2 dùng detection confidence thấp hơn để cứu track đang active.
 - Lost track được giữ trong `--track-buffer` frame, thử re-activate trước khi cấp ID mới.
 - Conditional ReID dùng color-hist appearance embedding nhẹ, chỉ kích hoạt khi cần nối lost track hoặc cập nhật gallery cho track đã match.
+- Với cảnh đông, `--det-iou` cao và `--max-det` lớn giúp YOLO giữ lại nhiều box chồng nhau hơn sau NMS.
