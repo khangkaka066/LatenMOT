@@ -78,6 +78,9 @@ Nếu video có đám đông, dùng preset nhạy hơn:
   --stage2-min-iou 0.05 \
   --track-buffer 90 \
   --draw-lost-frames 20 \
+  --motion-gate 24 \
+  --lost-motion-gate 50 \
+  --motion-lambda 0.1 \
   --person-class 0
 ```
 
@@ -90,3 +93,4 @@ Nếu video có đám đông, dùng preset nhạy hơn:
 - Lost track được giữ trong `--track-buffer` frame, thử re-activate trước khi cấp ID mới.
 - Conditional ReID dùng color-hist appearance embedding nhẹ, chỉ kích hoạt khi cần nối lost track hoặc cập nhật gallery cho track đã match.
 - Với cảnh đông, `--det-iou` cao và `--max-det` lớn giúp YOLO giữ lại nhiều box chồng nhau hơn sau NMS.
+- Kalman dùng adaptive uncertainty, confidence-aware update và Mahalanobis motion gating để giảm nối nhầm ID.

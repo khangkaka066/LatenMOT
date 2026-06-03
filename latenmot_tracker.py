@@ -42,6 +42,9 @@ class LatenMOTConfig:
     reactivation_cost_thresh: float = 0.72
     track_buffer: int = 60
     draw_lost_frames: int = 12
+    motion_gate: float = 18.0
+    lost_motion_gate: float = 35.0
+    motion_lambda: float = 0.15
     min_box_area: float = 12.0
     use_reid: bool = True
     use_active_reid: bool = True
@@ -103,19 +106,42 @@ def iou_cost(tracks: Sequence["Track"], detections: Sequence[Detection]) -> np.n
     return 1.0 - bbox_iou(track_boxes, det_boxes)
 
 
+def motion_gated_iou_cost(
+    tracks: Sequence["Track"],
+    detections: Sequence[Detection],
+    kf: "KalmanFilter",
+    gate_limit: float,
+    motion_lambda: float,
+) -> np.ndarray:
+    if not tracks or not detections:
+        return np.zeros((len(tracks), len(detections)), dtype=np.float32)
+
+    cost = iou_cost(tracks, detections)
+    measurements = np.array([tlwh_to_xyah(det.tlwh) for det in detections], dtype=np.float32)
+    for r, track in enumerate(tracks):
+        gate = kf.gating_distance(track.mean, track.covariance, measurements)
+        cost[r, gate > gate_limit] = np.inf
+        cost[r] = cost[r] + motion_lambda * np.clip(gate / gate_limit, 0.0, 2.0)
+    return cost
+
+
 def active_association_cost(
-    tracks: Sequence["Track"], detections: Sequence[Detection], cfg: LatenMOTConfig
+    tracks: Sequence["Track"], detections: Sequence[Detection], cfg: LatenMOTConfig, kf: "KalmanFilter"
 ) -> np.ndarray:
     if not tracks or not detections:
         return np.zeros((len(tracks), len(detections)), dtype=np.float32)
 
     iou_dist = iou_cost(tracks, detections)
+    measurements = np.array([tlwh_to_xyah(det.tlwh) for det in detections], dtype=np.float32)
     if not cfg.use_reid or not cfg.use_active_reid:
-        return iou_dist
+        return motion_gated_iou_cost(tracks, detections, kf, cfg.motion_gate, cfg.motion_lambda)
 
     cost = np.full_like(iou_dist, fill_value=np.inf, dtype=np.float32)
     for r, track in enumerate(tracks):
+        gate = kf.gating_distance(track.mean, track.covariance, measurements)
         for c, det in enumerate(detections):
+            if gate[c] > cfg.motion_gate:
+                continue
             iou = 1.0 - float(iou_dist[r, c])
             app_dist = cosine_distance(track.smooth_feature, det.feature)
             can_use_motion = iou >= cfg.stage1_min_iou
@@ -130,6 +156,7 @@ def active_association_cost(
                     if can_use_appearance
                     else iou_dist[r, c]
                 )
+                cost[r, c] += cfg.motion_lambda * min(float(gate[c]) / cfg.motion_gate, 2.0)
     return cost
 
 
@@ -196,23 +223,26 @@ class KalmanFilter:
         covariance = np.diag(np.square(std))
         return mean, covariance
 
-    def predict(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(
+        self, mean: np.ndarray, covariance: np.ndarray, lost_frames: int = 0
+    ) -> Tuple[np.ndarray, np.ndarray]:
         h = max(1.0, float(mean[3]))
+        uncertainty = min(1.0 + 0.25 * max(0, lost_frames), 4.0)
         std_pos = np.array(
             [
-                self.std_weight_position * h,
-                self.std_weight_position * h,
+                self.std_weight_position * h * uncertainty,
+                self.std_weight_position * h * uncertainty,
                 1e-2,
-                self.std_weight_position * h,
+                self.std_weight_position * h * uncertainty,
             ],
             dtype=np.float32,
         )
         std_vel = np.array(
             [
-                self.std_weight_velocity * h,
-                self.std_weight_velocity * h,
+                self.std_weight_velocity * h * uncertainty,
+                self.std_weight_velocity * h * uncertainty,
                 1e-5,
-                self.std_weight_velocity * h,
+                self.std_weight_velocity * h * uncertainty,
             ],
             dtype=np.float32,
         )
@@ -221,14 +251,18 @@ class KalmanFilter:
         covariance = self.motion_mat @ covariance @ self.motion_mat.T + motion_cov
         return mean.astype(np.float32), covariance.astype(np.float32)
 
-    def project(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def project(
+        self, mean: np.ndarray, covariance: np.ndarray, score: float = 1.0
+    ) -> Tuple[np.ndarray, np.ndarray]:
         h = max(1.0, float(mean[3]))
+        score = float(np.clip(score, 0.01, 1.0))
+        measurement_scale = 1.0 + 2.5 * (1.0 - score)
         std = np.array(
             [
-                self.std_weight_position * h,
-                self.std_weight_position * h,
-                1e-1,
-                self.std_weight_position * h,
+                self.std_weight_position * h * measurement_scale,
+                self.std_weight_position * h * measurement_scale,
+                1e-1 * measurement_scale,
+                self.std_weight_position * h * measurement_scale,
             ],
             dtype=np.float32,
         )
@@ -238,14 +272,29 @@ class KalmanFilter:
         return projected_mean.astype(np.float32), projected_cov.astype(np.float32)
 
     def update(
-        self, mean: np.ndarray, covariance: np.ndarray, measurement: np.ndarray
+        self, mean: np.ndarray, covariance: np.ndarray, measurement: np.ndarray, score: float = 1.0
     ) -> Tuple[np.ndarray, np.ndarray]:
-        projected_mean, projected_cov = self.project(mean, covariance)
+        projected_mean, projected_cov = self.project(mean, covariance, score)
         kalman_gain = covariance @ self.update_mat.T @ np.linalg.inv(projected_cov)
         innovation = measurement - projected_mean
         new_mean = mean + kalman_gain @ innovation
         new_covariance = covariance - kalman_gain @ projected_cov @ kalman_gain.T
         return new_mean.astype(np.float32), new_covariance.astype(np.float32)
+
+    def gating_distance(
+        self, mean: np.ndarray, covariance: np.ndarray, measurements: np.ndarray
+    ) -> np.ndarray:
+        if len(measurements) == 0:
+            return np.zeros((0,), dtype=np.float32)
+        projected_mean, projected_cov = self.project(mean, covariance)
+        eye = np.eye(self.ndim, dtype=np.float32)
+        try:
+            chol = np.linalg.cholesky(projected_cov + eye * 1e-6)
+        except np.linalg.LinAlgError:
+            chol = np.linalg.cholesky(projected_cov + eye * 1e-3)
+        diff = (measurements - projected_mean).T
+        z = np.linalg.solve(chol, diff)
+        return np.sum(z * z, axis=0).astype(np.float32)
 
 
 class ColorHistReID:
@@ -296,13 +345,16 @@ class Track:
     def xyxy(self) -> np.ndarray:
         return tlwh_to_xyxy(self.tlwh)
 
-    def predict(self, kf: KalmanFilter) -> None:
+    def predict(self, kf: KalmanFilter, frame_id: int) -> None:
         if self.state != TrackState.TRACKED:
             self.mean[7] = 0
-        self.mean, self.covariance = kf.predict(self.mean, self.covariance)
+        lost_frames = max(0, frame_id - self.last_seen) if self.state == TrackState.LOST else 0
+        self.mean, self.covariance = kf.predict(self.mean, self.covariance, lost_frames)
 
     def update(self, detection: Detection, frame_id: int, kf: KalmanFilter, alpha: float) -> None:
-        self.mean, self.covariance = kf.update(self.mean, self.covariance, tlwh_to_xyah(detection.tlwh))
+        self.mean, self.covariance = kf.update(
+            self.mean, self.covariance, tlwh_to_xyah(detection.tlwh), detection.score
+        )
         self.score = detection.score
         self.cls = detection.cls
         self.state = TrackState.TRACKED
@@ -347,10 +399,15 @@ class LatenMOTTracker:
             return np.zeros((len(lost_tracks), len(detections)), dtype=np.float32)
 
         iou_dist = iou_cost(lost_tracks, detections)
+        measurements = np.array([tlwh_to_xyah(det.tlwh) for det in detections], dtype=np.float32)
         cost = np.full_like(iou_dist, fill_value=np.inf, dtype=np.float32)
         for r, track in enumerate(lost_tracks):
             gap = self.frame_id - track.last_seen
+            gate = self.kf.gating_distance(track.mean, track.covariance, measurements)
+            gate_limit = self.cfg.lost_motion_gate * min(1.0 + 0.05 * gap, 2.0)
             for c, det in enumerate(detections):
+                if gate[c] > gate_limit:
+                    continue
                 app_dist = cosine_distance(track.smooth_feature, det.feature)
                 iou = 1.0 - float(iou_dist[r, c])
                 can_use_motion = iou >= self.cfg.reactivation_min_iou
@@ -366,6 +423,7 @@ class LatenMOTTracker:
                         cost[r, c] = 0.45 * iou_dist[r, c] + 0.55 * app_dist
                     else:
                         cost[r, c] = iou_dist[r, c]
+                    cost[r, c] += self.cfg.motion_lambda * min(float(gate[c]) / gate_limit, 2.0)
         return cost
 
     def update(self, frame: np.ndarray, detections: List[Detection]) -> List[Track]:
@@ -381,7 +439,7 @@ class LatenMOTTracker:
 
         for track in self.tracks:
             if track.state in (TrackState.TRACKED, TrackState.LOST):
-                track.predict(self.kf)
+                track.predict(self.kf, self.frame_id)
 
         active_tracks = [t for t in self.tracks if t.state == TrackState.TRACKED]
         lost_tracks = [t for t in self.tracks if t.state == TrackState.LOST]
@@ -392,7 +450,7 @@ class LatenMOTTracker:
         if self.cfg.use_active_reid:
             self._ensure_features(frame, high_dets, range(len(high_dets)))
         stage1_matches, unmatched_active, unmatched_high = linear_assignment_with_threshold(
-            active_association_cost(active_tracks, high_dets, self.cfg),
+            active_association_cost(active_tracks, high_dets, self.cfg, self.kf),
             max_cost=1.0 - self.cfg.stage1_min_iou,
         )
         for trk_idx, det_idx in stage1_matches:
@@ -402,7 +460,14 @@ class LatenMOTTracker:
         # Stage 2: low confidence detections can keep existing tracks alive.
         remaining_active = [active_tracks[i] for i in unmatched_active]
         stage2_matches, unmatched_remaining_active, _ = linear_assignment_with_threshold(
-            iou_cost(remaining_active, low_dets), max_cost=1.0 - self.cfg.stage2_min_iou
+            motion_gated_iou_cost(
+                remaining_active,
+                low_dets,
+                self.kf,
+                self.cfg.motion_gate * 1.5,
+                self.cfg.motion_lambda,
+            ),
+            max_cost=1.0 - self.cfg.stage2_min_iou,
         )
         for trk_idx, det_idx in stage2_matches:
             self._ensure_features(frame, low_dets, [det_idx])
@@ -556,6 +621,9 @@ def run_video(args: argparse.Namespace) -> None:
         reactivation_cost_thresh=args.reactivation_cost_thresh,
         track_buffer=args.track_buffer,
         draw_lost_frames=args.draw_lost_frames,
+        motion_gate=args.motion_gate,
+        lost_motion_gate=args.lost_motion_gate,
+        motion_lambda=args.motion_lambda,
         min_box_area=args.min_box_area,
         use_reid=not args.no_reid,
         use_active_reid=not args.no_active_reid,
@@ -636,6 +704,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--reactivation-cost-thresh", type=float, default=0.72)
     parser.add_argument("--track-buffer", type=int, default=60)
     parser.add_argument("--draw-lost-frames", type=int, default=12)
+    parser.add_argument("--motion-gate", type=float, default=18.0)
+    parser.add_argument("--lost-motion-gate", type=float, default=35.0)
+    parser.add_argument("--motion-lambda", type=float, default=0.15)
     parser.add_argument("--reid-after-frames", type=int, default=2)
     parser.add_argument("--feature-alpha", type=float, default=0.9)
     parser.add_argument("--min-box-area", type=float, default=12.0)
