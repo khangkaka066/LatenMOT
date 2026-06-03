@@ -81,6 +81,10 @@ Nếu video có đám đông, dùng preset nhạy hơn:
   --motion-gate 24 \
   --lost-motion-gate 50 \
   --motion-lambda 0.1 \
+  --occlusion-coverage-thresh 0.4 \
+  --occlusion-velocity-damping 0.5 \
+  --occlusion-reset-alpha 0.1 \
+  --occlusion-box-enlarge 1.3 \
   --person-class 0
 ```
 
@@ -94,3 +98,4 @@ Nếu video có đám đông, dùng preset nhạy hơn:
 - Conditional ReID dùng color-hist appearance embedding nhẹ, chỉ kích hoạt khi cần nối lost track hoặc cập nhật gallery cho track đã match.
 - Với cảnh đông, `--det-iou` cao và `--max-det` lớn giúp YOLO giữ lại nhiều box chồng nhau hơn sau NMS.
 - Kalman dùng adaptive uncertainty, confidence-aware update và Mahalanobis motion gating để giảm nối nhầm ID.
+- Occlusion-aware Kalman phát hiện track bị che bằng coverage ratio, giảm velocity, reset mềm về vị trí quan sát cuối và nới box tìm kiếm khi re-activate.

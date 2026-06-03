@@ -45,6 +45,10 @@ class LatenMOTConfig:
     motion_gate: float = 18.0
     lost_motion_gate: float = 35.0
     motion_lambda: float = 0.15
+    occlusion_coverage_thresh: float = 0.45
+    occlusion_velocity_damping: float = 0.55
+    occlusion_reset_alpha: float = 0.08
+    occlusion_box_enlarge: float = 1.25
     min_box_area: float = 12.0
     use_reid: bool = True
     use_active_reid: bool = True
@@ -104,6 +108,29 @@ def iou_cost(tracks: Sequence["Track"], detections: Sequence[Detection]) -> np.n
     track_boxes = np.array([t.xyxy for t in tracks], dtype=np.float32)
     det_boxes = np.array([d.xyxy for d in detections], dtype=np.float32)
     return 1.0 - bbox_iou(track_boxes, det_boxes)
+
+
+def track_iou_cost(
+    tracks: Sequence["Track"], detections: Sequence[Detection], use_search_box: bool = False
+) -> np.ndarray:
+    track_boxes = np.array(
+        [t.search_xyxy if use_search_box else t.xyxy for t in tracks], dtype=np.float32
+    )
+    det_boxes = np.array([d.xyxy for d in detections], dtype=np.float32)
+    return 1.0 - bbox_iou(track_boxes, det_boxes)
+
+
+def coverage_ratio(target: np.ndarray, occluders: np.ndarray) -> float:
+    if len(occluders) == 0:
+        return 0.0
+    target = target.astype(np.float32)
+    occluders = occluders.astype(np.float32)
+    target_area = max(1e-6, float((target[2] - target[0]) * (target[3] - target[1])))
+    lt = np.maximum(target[None, :2], occluders[:, :2])
+    rb = np.minimum(target[None, 2:], occluders[:, 2:])
+    wh = np.clip(rb - lt, 0.0, None)
+    inter = wh[:, 0] * wh[:, 1]
+    return float(np.max(inter / target_area))
 
 
 def motion_gated_iou_cost(
@@ -281,6 +308,26 @@ class KalmanFilter:
         new_covariance = covariance - kalman_gain @ projected_cov @ kalman_gain.T
         return new_mean.astype(np.float32), new_covariance.astype(np.float32)
 
+    def apply_occlusion_damping(
+        self,
+        mean: np.ndarray,
+        covariance: np.ndarray,
+        last_observed_mean: Optional[np.ndarray],
+        velocity_damping: float,
+        reset_alpha: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        mean = mean.copy()
+        covariance = covariance.copy()
+        mean[4] *= velocity_damping
+        mean[5] *= velocity_damping
+        mean[6] *= velocity_damping
+        mean[7] *= velocity_damping
+        if last_observed_mean is not None:
+            mean[:2] = (1.0 - reset_alpha) * mean[:2] + reset_alpha * last_observed_mean[:2]
+            mean[2:4] = 0.95 * mean[2:4] + 0.05 * last_observed_mean[2:4]
+        covariance[:4, :4] *= 1.1
+        return mean.astype(np.float32), covariance.astype(np.float32)
+
     def gating_distance(
         self, mean: np.ndarray, covariance: np.ndarray, measurements: np.ndarray
     ) -> np.ndarray:
@@ -335,6 +382,10 @@ class Track:
         self.frame_id = frame_id
         self.last_seen = frame_id
         self.lost_since: Optional[int] = None
+        self.is_occluded = False
+        self.occlusion_age = 0
+        self.search_enlarge = 1.0
+        self.last_observed_mean = self.mean.copy()
         self.smooth_feature = detection.feature
 
     @property
@@ -345,11 +396,33 @@ class Track:
     def xyxy(self) -> np.ndarray:
         return tlwh_to_xyxy(self.tlwh)
 
-    def predict(self, kf: KalmanFilter, frame_id: int) -> None:
+    @property
+    def search_xyxy(self) -> np.ndarray:
+        tlwh = self.tlwh.copy()
+        if self.search_enlarge > 1.0:
+            cx = tlwh[0] + tlwh[2] / 2.0
+            cy = tlwh[1] + tlwh[3] / 2.0
+            tlwh[2] *= self.search_enlarge
+            tlwh[3] *= self.search_enlarge
+            tlwh[0] = cx - tlwh[2] / 2.0
+            tlwh[1] = cy - tlwh[3] / 2.0
+        return tlwh_to_xyxy(tlwh)
+
+    def predict(self, kf: KalmanFilter, frame_id: int, cfg: LatenMOTConfig) -> None:
         if self.state != TrackState.TRACKED:
             self.mean[7] = 0
         lost_frames = max(0, frame_id - self.last_seen) if self.state == TrackState.LOST else 0
         self.mean, self.covariance = kf.predict(self.mean, self.covariance, lost_frames)
+        if self.is_occluded:
+            self.occlusion_age += 1
+            self.search_enlarge = cfg.occlusion_box_enlarge
+            self.mean, self.covariance = kf.apply_occlusion_damping(
+                self.mean,
+                self.covariance,
+                self.last_observed_mean,
+                cfg.occlusion_velocity_damping,
+                cfg.occlusion_reset_alpha,
+            )
 
     def update(self, detection: Detection, frame_id: int, kf: KalmanFilter, alpha: float) -> None:
         self.mean, self.covariance = kf.update(
@@ -361,6 +434,10 @@ class Track:
         self.frame_id = frame_id
         self.last_seen = frame_id
         self.lost_since = None
+        self.is_occluded = False
+        self.occlusion_age = 0
+        self.search_enlarge = 1.0
+        self.last_observed_mean = self.mean.copy()
         if detection.feature is not None:
             if self.smooth_feature is None:
                 self.smooth_feature = detection.feature
@@ -373,6 +450,23 @@ class Track:
     def mark_lost(self, frame_id: int) -> None:
         self.state = TrackState.LOST
         self.lost_since = frame_id if self.lost_since is None else self.lost_since
+        self.is_occluded = False
+        self.search_enlarge = 1.0
+
+    def mark_occluded(self, frame_id: int, kf: KalmanFilter, cfg: LatenMOTConfig) -> None:
+        self.state = TrackState.LOST
+        self.lost_since = frame_id if self.lost_since is None else self.lost_since
+        if not self.is_occluded:
+            self.occlusion_age = 0
+        self.is_occluded = True
+        self.search_enlarge = cfg.occlusion_box_enlarge
+        self.mean, self.covariance = kf.apply_occlusion_damping(
+            self.mean,
+            self.covariance,
+            self.last_observed_mean,
+            cfg.occlusion_velocity_damping,
+            cfg.occlusion_reset_alpha,
+        )
 
     def mark_removed(self) -> None:
         self.state = TrackState.REMOVED
@@ -398,13 +492,15 @@ class LatenMOTTracker:
         if not lost_tracks or not detections:
             return np.zeros((len(lost_tracks), len(detections)), dtype=np.float32)
 
-        iou_dist = iou_cost(lost_tracks, detections)
+        iou_dist = track_iou_cost(lost_tracks, detections, use_search_box=True)
         measurements = np.array([tlwh_to_xyah(det.tlwh) for det in detections], dtype=np.float32)
         cost = np.full_like(iou_dist, fill_value=np.inf, dtype=np.float32)
         for r, track in enumerate(lost_tracks):
             gap = self.frame_id - track.last_seen
             gate = self.kf.gating_distance(track.mean, track.covariance, measurements)
             gate_limit = self.cfg.lost_motion_gate * min(1.0 + 0.05 * gap, 2.0)
+            if track.is_occluded:
+                gate_limit *= 1.4
             for c, det in enumerate(detections):
                 if gate[c] > gate_limit:
                     continue
@@ -426,6 +522,22 @@ class LatenMOTTracker:
                     cost[r, c] += self.cfg.motion_lambda * min(float(gate[c]) / gate_limit, 2.0)
         return cost
 
+    def _mark_unmatched_active(
+        self,
+        tracks: Sequence[Track],
+        matched_tracks: Sequence[Track],
+        detections: Sequence[Detection],
+    ) -> None:
+        tracked_boxes = [t.xyxy for t in matched_tracks if t.state == TrackState.TRACKED]
+        det_boxes = [d.xyxy for d in detections]
+        occluder_boxes = np.array(tracked_boxes + det_boxes, dtype=np.float32)
+        for track in tracks:
+            coverage = coverage_ratio(track.xyxy, occluder_boxes)
+            if coverage >= self.cfg.occlusion_coverage_thresh:
+                track.mark_occluded(self.frame_id, self.kf, self.cfg)
+            else:
+                track.mark_lost(self.frame_id)
+
     def update(self, frame: np.ndarray, detections: List[Detection]) -> List[Track]:
         self.frame_id += 1
 
@@ -439,7 +551,7 @@ class LatenMOTTracker:
 
         for track in self.tracks:
             if track.state in (TrackState.TRACKED, TrackState.LOST):
-                track.predict(self.kf, self.frame_id)
+                track.predict(self.kf, self.frame_id, self.cfg)
 
         active_tracks = [t for t in self.tracks if t.state == TrackState.TRACKED]
         lost_tracks = [t for t in self.tracks if t.state == TrackState.LOST]
@@ -473,8 +585,14 @@ class LatenMOTTracker:
             self._ensure_features(frame, low_dets, [det_idx])
             remaining_active[trk_idx].update(low_dets[det_idx], self.frame_id, self.kf, self.cfg.feature_alpha)
 
-        for trk_idx in unmatched_remaining_active:
-            remaining_active[trk_idx].mark_lost(self.frame_id)
+        matched_current_tracks = [
+            t for t in self.tracks if t.state == TrackState.TRACKED and t.last_seen == self.frame_id
+        ]
+        self._mark_unmatched_active(
+            [remaining_active[i] for i in unmatched_remaining_active],
+            matched_current_tracks,
+            detections,
+        )
 
         # Lost re-activation: try old IDs before creating new ones.
         remaining_high = [high_dets[i] for i in unmatched_high]
@@ -574,7 +692,7 @@ def draw_tracks(frame: np.ndarray, tracks: Sequence[Track]) -> np.ndarray:
         color = id_color(track.track_id) if track.state == TrackState.TRACKED else (180, 180, 180)
         thickness = 2 if track.state == TrackState.TRACKED else 1
         cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
-        prefix = "ID" if track.state == TrackState.TRACKED else "LOST"
+        prefix = "ID" if track.state == TrackState.TRACKED else ("OCC" if track.is_occluded else "LOST")
         label = f"{prefix} {track.track_id} {track.score:.2f}"
         (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         y_text = max(0, y1 - th - baseline - 4)
@@ -624,6 +742,10 @@ def run_video(args: argparse.Namespace) -> None:
         motion_gate=args.motion_gate,
         lost_motion_gate=args.lost_motion_gate,
         motion_lambda=args.motion_lambda,
+        occlusion_coverage_thresh=args.occlusion_coverage_thresh,
+        occlusion_velocity_damping=args.occlusion_velocity_damping,
+        occlusion_reset_alpha=args.occlusion_reset_alpha,
+        occlusion_box_enlarge=args.occlusion_box_enlarge,
         min_box_area=args.min_box_area,
         use_reid=not args.no_reid,
         use_active_reid=not args.no_active_reid,
@@ -707,6 +829,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--motion-gate", type=float, default=18.0)
     parser.add_argument("--lost-motion-gate", type=float, default=35.0)
     parser.add_argument("--motion-lambda", type=float, default=0.15)
+    parser.add_argument("--occlusion-coverage-thresh", type=float, default=0.45)
+    parser.add_argument("--occlusion-velocity-damping", type=float, default=0.55)
+    parser.add_argument("--occlusion-reset-alpha", type=float, default=0.08)
+    parser.add_argument("--occlusion-box-enlarge", type=float, default=1.25)
     parser.add_argument("--reid-after-frames", type=int, default=2)
     parser.add_argument("--feature-alpha", type=float, default=0.9)
     parser.add_argument("--min-box-area", type=float, default=12.0)
